@@ -6,6 +6,9 @@
 * 拒绝不留记录：区间不存在 404 / 区间开放 422 / 快照已变 stale_snapshot；
 * 幂等与冲突：同案件编号同请求重试即使现况已变（变化/重开/消失）也返回
   原包（200 replayed），异请求 case_id_conflict；失败不留封存记录；
+* 数据库操作异常（OperationalError）回滚后的恢复裁决：commit 已落库后抛错
+  时同请求返回原包（200 replayed）；查到异请求封存一律 409
+  case_id_conflict 且不泄露 / 不改写原封存；查无封存沿事务路径重试成功；
 * 查询：GET 返回原内容与摘要；未知案件 seal_not_found；
 * 现况对照：unchanged / changed / reopened / disappeared 四态，证据项
   （自有事件 / 车载读数 / 装卸窗口）增删变更、责任片段增删变更，区间
@@ -18,11 +21,19 @@
   后续隔离状态与覆盖集合变化（重叠故障撤销一条仍隔离、撤销最后一条恢复）
   在对照中逐项体现，封存原文 / 摘要永不改。
 """
+import sqlite3
+
+import pytest
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
+
 from fastapi.testclient import TestClient
 
+from app import evidence_crud
 from app.database import Base, SessionLocal, engine
 from app.main import app
 from app.models import EvidenceSeal
+from app.schemas import EvidenceSealCreate
 
 
 def setup_cargo(client, cargo="C1", limit="5", holder="A",
@@ -291,6 +302,156 @@ def test_seal_same_case_different_request_conflicts(client):
     # 原包仍可查、内容不变
     got = client.get("/evidence-seals/CASE-K").json()
     assert got["cargo_id"] == "C1" and got["snapshot_id"] == snap
+
+
+# ------------------------------------- OperationalError 恢复分支（异常重试裁决）
+
+
+def _locked_error() -> OperationalError:
+    """模拟 SQLite 文件库锁等待耗尽 / PG 死锁中止形态的数据库操作异常。"""
+    return OperationalError(
+        "INSERT INTO evidence_seal ...",
+        {},
+        sqlite3.OperationalError("database is locked"),
+    )
+
+
+def _seal_payload(case_id, cargo_id, interval_id, snapshot_id) -> EvidenceSealCreate:
+    return EvidenceSealCreate(
+        case_id=case_id,
+        cargo_id=cargo_id,
+        interval_id=interval_id,
+        snapshot_id=snapshot_id,
+    )
+
+
+def test_seal_recovery_replays_when_commit_landed_same_request(client, monkeypatch):
+    """commit 已落库后抛 OperationalError：回滚后按案件编号查到的封存与本次
+    请求三元组一致 -> 返回原包并标记重放（200 replayed），不新增封存。"""
+    iid, snap = build_two_party_interval(client, )
+    case_id = "CASE-REC-OK"
+
+    real_commit = Session.commit
+    state = {"calls": 0}
+
+    def commit_then_fail(self):
+        state["calls"] += 1
+        real_commit(self)  # 封存行已落库 ...
+        if state["calls"] == 1:
+            raise _locked_error()  # ... 但提交结果在到达调用方前丢失
+
+    monkeypatch.setattr(Session, "commit", commit_then_fail)
+    r = client.post(
+        "/evidence-seals",
+        json={"case_id": case_id, "cargo_id": "C1",
+              "interval_id": iid, "snapshot_id": snap},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["replayed"] is True
+    assert body["seal"]["case_id"] == case_id
+    assert body["seal"]["cargo_id"] == "C1"
+    assert body["seal"]["interval_id"] == iid
+    assert body["seal"]["snapshot_id"] == snap
+    assert seal_count() == 1  # 恢复重放不新增
+
+    # 此后普通重传与查询都恒为原包
+    got = client.get(f"/evidence-seals/{case_id}").json()
+    assert got == body["seal"]
+
+
+@pytest.mark.parametrize(
+    "loser_cargo,loser_interval,loser_snapshot",
+    [
+        # 货物编号不同
+        ("C2", None, None),
+        # 区间标识不同
+        ("C1", "m-other", None),
+        # 快照标识不同
+        ("C1", None, "sha256:" + "e" * 64),
+    ],
+)
+def test_seal_recovery_foreign_winner_conflicts_without_leak(
+    client, monkeypatch, loser_cargo, loser_interval, loser_snapshot
+):
+    """回滚后按案件编号查到的封存与本次请求三元组任一不同（货物 / 区间 /
+    快照）：一律 409 case_id_conflict，且不返回、不改写、不泄露原封存内容。"""
+    iid, snap = build_two_party_interval(client, )
+    setup_cargo(client, cargo="C2")  # 异货物变体中的 C2（其余变体不使用）
+    case_id = "CASE-REC-CONF"
+    winner = seal(client, case_id, "C1", iid, snap).json()
+
+    loser_interval = loser_interval or iid
+    loser_snapshot = loser_snapshot or snap
+
+    real_tx = evidence_crud._create_seal_tx
+    state = {"calls": 0}
+
+    def flaky_tx(db, payload):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            # 模拟并发竞争：本请求在 commit 前遭遇数据库操作异常，而另一请求
+            # （赢家）已就同一案件编号提交了不同三元组的封存。
+            real_tx(db, _seal_payload(case_id, "C1", iid, snap))
+            raise _locked_error()
+        return real_tx(db, payload)
+
+    monkeypatch.setattr(evidence_crud, "_create_seal_tx", flaky_tx)
+    r = client.post(
+        "/evidence-seals",
+        json={"case_id": case_id, "cargo_id": loser_cargo,
+              "interval_id": loser_interval, "snapshot_id": loser_snapshot},
+    )
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body["error"]["code"] == "case_id_conflict"
+    # 冲突裁决在重验货物 / 区间 / 快照之前成立：异常路径不继续重试
+    assert state["calls"] == 1
+    # 不泄露原封存内容：错误体只有 code/message，且不含赢家的货物 / 区间 /
+    # 快照 / 摘要等任何封存信息
+    assert set(body["error"]) == {"code", "message"}
+    message = body["error"]["message"]
+    assert "C1" not in message
+    assert iid not in message
+    assert snap not in message
+    assert winner["content_digest"] not in r.text
+    assert "content" not in body and "seal" not in body
+
+    # 原封存不被改写，仍可按原内容查询；只有赢家一条封存
+    got = client.get(f"/evidence-seals/{case_id}").json()
+    assert got == winner
+    assert seal_count() == 1
+
+
+def test_seal_recovery_retries_tx_when_no_winner(client, monkeypatch):
+    """回滚后按案件编号查不到封存：沿既有事务路径整体重试 -> 成功创建 201。"""
+    iid, snap = build_two_party_interval(client, )
+    case_id = "CASE-REC-RETRY"
+
+    real_tx = evidence_crud._create_seal_tx
+    state = {"calls": 0}
+
+    def flaky_tx(db, payload):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            # 锁等待耗尽 / 死锁中止，且无任何封存落库
+            raise _locked_error()
+        return real_tx(db, payload)
+
+    monkeypatch.setattr(evidence_crud, "_create_seal_tx", flaky_tx)
+    r = client.post(
+        "/evidence-seals",
+        json={"case_id": case_id, "cargo_id": "C1",
+              "interval_id": iid, "snapshot_id": snap},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["case_id"] == case_id
+    assert state["calls"] == 2  # 首传失败后整事务重试一次
+    assert seal_count() == 1
+    # 重试成功后的普通重传仍走既有幂等契约
+    again = seal(client, case_id, "C1", iid, snap, expected=200)
+    assert again.json()["replayed"] is True
+    assert seal_count() == 1
 
 
 # --------------------------------------------------------------- 现况对照

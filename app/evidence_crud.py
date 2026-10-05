@@ -13,6 +13,15 @@
   （``replayed=true``）——封存成功后其裁决不再依赖当前数据；
 * 同 ``case_id`` + 异请求 → ``409 case_id_conflict``，原封存不变。
 
+数据库操作异常（``OperationalError``，如 SQLite 文件库锁等待耗尽 / PG
+死锁检测中止，也可能在 commit 已落库后抛出）回滚后，按案件编号复核：
+
+* 查到封存且**与本次请求三元组一致**：返回原包并标记重放；
+* 查到封存但**三元组任一不同**（货物 / 区间 / 快照）：``409
+  case_id_conflict``，**不返回、不改写、不泄露原封存的任何内容**；
+* 查不到封存：沿既有事务路径整体重试（成功创建 / 普通重传 / 快照校验
+  的现有契约不变）。
+
 封存行 append-only：任何接口都不修改 / 不删除已封存内容；晚到记录与更正
 只影响 :mod:`app.sealing` 的现况对照结果。
 """
@@ -62,11 +71,23 @@ def create_seal(db, payload: EvidenceSealCreate) -> SealWriteResult:
     except OperationalError:
         # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变。
         # OperationalError 也可能在 commit 已落库后抛出——封存成功后重试即使
-        # 现况已变也必须返回原包，故重放前先按案件编号检测已落库的封存包。
+        # 现况已变也必须返回原包，故重放前先按案件编号检测已落库的封存包，
+        # 并像快路径 / 持锁复核一样按本次请求三元组（货物编号、区间标识、
+        # 快照标识）核对：三者一致才按重放返回原包；查到的若是**异请求**封存
+        # （如并发首传的赢家），报 409 case_id_conflict，绝不返回 / 改写 /
+        # 泄露原包内容；查无封存再沿既有事务路径整体重试。
         db.rollback()
         winner = db.get(EvidenceSeal, payload.case_id)
         if winner is not None:
-            return _replay(winner)
+            if _same_request(
+                winner, payload.cargo_id, payload.interval_id, payload.snapshot_id
+            ):
+                return _replay(winner)
+            db.rollback()  # 只读裁决，结束事务
+            raise _conflict(
+                f"案件编号 {payload.case_id} 已封存不同请求的证据包，拒绝覆盖",
+                code="case_id_conflict",
+            )
         return _create_seal_tx(db, payload)
 
 
