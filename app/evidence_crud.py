@@ -13,6 +13,12 @@
   （``replayed=true``）——封存成功后其裁决不再依赖当前数据；
 * 同 ``case_id`` + 异请求 → ``409 case_id_conflict``，原封存不变。
 
+上述裁决对正常事务路径与**数据库操作异常（``OperationalError``，可能在
+commit 落库后才抛出）后的恢复路径**一视同仁：回滚后按案件编号查到已落库
+封存时，必须再按本次请求的货物 / 区间 / 快照三元组核对——三者一致才回放
+原包，任一不同仍报 ``409 case_id_conflict``，且不回传原封存的任何字段；
+查不到封存时沿既有事务路径整事务重试。
+
 封存行 append-only：任何接口都不修改 / 不删除已封存内容；晚到记录与更正
 只影响 :mod:`app.sealing` 的现况对照结果。
 """
@@ -57,16 +63,27 @@ def _same_request(row: EvidenceSeal, cargo_id: str, interval_key: str, snapshot_
 
 
 def create_seal(db, payload: EvidenceSealCreate) -> SealWriteResult:
+    cargo_id = payload.cargo_id
+    interval_key = payload.interval_id
+    snapshot_id = payload.snapshot_id
     try:
         return _create_seal_tx(db, payload)
     except OperationalError:
         # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变。
         # OperationalError 也可能在 commit 已落库后抛出——封存成功后重试即使
         # 现况已变也必须返回原包，故重放前先按案件编号检测已落库的封存包。
+        # 注意案件编号可能属于另一请求（货物 / 区间 / 快照任一不同）：必须按
+        # 本次请求三元组核对，同请求才回放原包，异请求一律按冲突拒绝，且绝不
+        # 改写或泄露原封存内容。
         db.rollback()
         winner = db.get(EvidenceSeal, payload.case_id)
         if winner is not None:
-            return _replay(winner)
+            if _same_request(winner, cargo_id, interval_key, snapshot_id):
+                return _replay(winner)
+            raise _conflict(
+                f"案件编号 {payload.case_id} 已封存不同请求的证据包，拒绝覆盖",
+                code="case_id_conflict",
+            )
         return _create_seal_tx(db, payload)
 
 
@@ -88,10 +105,9 @@ def _create_seal_tx(db, payload: EvidenceSealCreate) -> SealWriteResult:
         if _same_request(existing, cargo_id, interval_key, snapshot_id):
             db.rollback()  # 只读裁决，结束事务
             return _replay(existing)
+        # 不回显原封存的货物 / 区间 / 快照，避免泄露原封存内容
         raise _conflict(
-            f"案件编号 {case_id} 已封存不同请求的证据包"
-            f"（既存：货物 {existing.cargo_id} / 区间 {existing.interval_key} / "
-            f"快照 {existing.snapshot_id}），拒绝覆盖",
+            f"案件编号 {case_id} 已封存不同请求的证据包，拒绝覆盖",
             code="case_id_conflict",
         )
 

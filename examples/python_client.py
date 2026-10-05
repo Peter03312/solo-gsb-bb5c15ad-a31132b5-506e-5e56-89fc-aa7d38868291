@@ -707,6 +707,38 @@ def main() -> None:
              api.get("/evidence-seals/CASE-SEAL-PY-1/diff"))
         show("未知案件（404 seal_not_found）", api.get("/evidence-seals/NO-SUCH-CASE"))
 
+        # ----- 数据库操作异常后的封存重试裁决 -----
+        # 服务端在锁等待耗尽 / 死锁中止（可能 commit 已落库后才报错）时：
+        # 回滚 -> 按 case_id 复查 -> 与本次（货物/区间/快照）三元组核对。
+        # 客户端只需用【完全相同的请求体】重发；三种裁决的契约演示如下：
+        print("\n########## 封存异常恢复后的重试裁决 ##########")
+        rc = "COLD-SEAL-RETRY-PY"
+        api.post("/cargo", json={
+            "cargo_id": rc, "started_at": "2026-10-12T08:00:00+08:00",
+            "temp_upper_limit": "5.0", "initial_holder": "甲冷库"})
+        api.post("/events", json={
+            "event_id": "re-py-m1", "cargo_id": rc,
+            "occurred_at": "2026-10-12T09:00:00+08:00", "temperature": "8.0"})
+        api.post("/events", json={
+            "event_id": "re-py-m2", "cargo_id": rc,
+            "occurred_at": "2026-10-12T10:00:00+08:00", "temperature": "4.0"})
+        riv = api.get(f"/cargo/{rc}/responsibilities").json()["intervals"][0]
+        retry_body = {
+            "case_id": "CASE-SEAL-RETRY-PY-1",
+            "cargo_id": rc,
+            "interval_id": riv["interval_id"],
+            "snapshot_id": riv["snapshot_id"],
+        }
+        show("a) 首次创建 201（恢复路径查无封存时即按此路径重试创建）",
+             api.post("/evidence-seals", json=retry_body))
+        show("b) 同 case_id + 同三元组重发 -> 200 replayed=true（原包不变）",
+             api.post("/evidence-seals", json=retry_body))
+        show("c) 同 case_id + 异快照 -> 409 case_id_conflict（不回显原封存字段）",
+             api.post("/evidence-seals",
+                      json={**retry_body, "snapshot_id": "sha256:" + "e" * 64}))
+        show("d) 原封存仍可原样查询（append-only，未被改写）",
+             api.get("/evidence-seals/CASE-SEAL-RETRY-PY-1"))
+
         # ----- 车次探头故障登记 / 撤销（独立演示车次，避免影响上面封存链路）-----
         print("\n########## 车次探头故障登记 / 撤销 ##########")
         fc = "COLD-FAULT-PY-1"

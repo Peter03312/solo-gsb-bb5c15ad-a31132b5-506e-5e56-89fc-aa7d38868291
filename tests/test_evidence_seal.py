@@ -284,6 +284,7 @@ def test_seal_same_case_different_request_conflicts(client):
     other = "sha256:" + "f" * 64
     r = seal(client, "CASE-K", "C1", iid, other, expected=409)
     assert r.json()["error"]["code"] == "case_id_conflict"
+    assert "cargo" not in r.json()["error"]["message"]
     # 异货物同样冲突
     setup_cargo(client, cargo="C2")
     r = seal(client, "CASE-K", "C2", iid, snap, expected=409)
@@ -291,6 +292,108 @@ def test_seal_same_case_different_request_conflicts(client):
     # 原包仍可查、内容不变
     got = client.get("/evidence-seals/CASE-K").json()
     assert got["cargo_id"] == "C1" and got["snapshot_id"] == snap
+
+
+# ------------------------------------------- 数据库异常后的恢复裁决（幂等/冲突）
+
+
+def _fail_first_tx_get_with_operational_error(monkeypatch):
+    """让下一个请求事务的首次 ``db.get`` 抛 OperationalError。
+
+    模拟 SQLite 锁等待耗尽 / PG 死锁中止（以及“commit 实际已落库但驱动报错”
+    的歧义时刻）：create_seal 捕获后回滚，进入按案件编号恢复裁决分支。
+    第二次起的 get（恢复查询 / 重试事务）一律放行。
+    """
+    import sqlalchemy.orm as orm
+    from sqlalchemy.exc import OperationalError
+
+    state = {"armed": True}
+    real_get = orm.Session.get
+
+    def flaky_get(self, entity, *args, **kwargs):
+        if state["armed"]:
+            state["armed"] = False
+            raise OperationalError(
+                "SELECT ... (simulated lock/deadlock abort)", {},
+                Exception("simulated operational failure"),
+            )
+        return real_get(self, entity, *args, **kwargs)
+
+    monkeypatch.setattr(orm.Session, "get", flaky_get)
+    return state
+
+
+def test_seal_recovery_replays_same_request_after_operational_error(
+    client, monkeypatch
+):
+    """恢复分支：按案件编号查到的已落库封存与本次三元组一致 -> 200 replayed。"""
+    iid, snap = build_two_party_interval(client, )
+    created = seal(client, "CASE-OE-OK", "C1", iid, snap).json()
+
+    # 即便现况已变（快照变化），同请求在异常恢复后仍回放原包
+    assert m(client, "m1b", 20, 4).status_code == 201
+    _fail_first_tx_get_with_operational_error(monkeypatch)
+    r = seal(client, "CASE-OE-OK", "C1", iid, snap, expected=200)
+    body = r.json()
+    assert body["replayed"] is True
+    assert body["seal"]["content"] == created["content"]
+    assert body["seal"]["content_digest"] == created["content_digest"]
+    assert seal_count() == 1  # 恢复不新增、不改写
+
+
+def test_seal_recovery_conflicts_on_different_snapshot_after_operational_error(
+    client, monkeypatch
+):
+    """恢复分支：同案件编号但快照不同 -> 409 case_id_conflict，原包不泄露。"""
+    iid, snap = build_two_party_interval(client, )
+    created = seal(client, "CASE-OE-SNAP", "C1", iid, snap).json()
+
+    other = "sha256:" + "f" * 64
+    _fail_first_tx_get_with_operational_error(monkeypatch)
+    r = seal(client, "CASE-OE-SNAP", "C1", iid, other, expected=409)
+    err = r.json()["error"]
+    assert err["code"] == "case_id_conflict"
+    # 不得泄露原封存内容（快照标识 / 摘要 / 正文均不得出现在错误响应中）
+    assert snap not in err["message"]
+    assert created["content_digest"] not in err["message"]
+    # 原封存未被改写，仍可原样查询
+    got = client.get("/evidence-seals/CASE-OE-SNAP")
+    assert got.status_code == 200 and got.json() == created
+    assert seal_count() == 1
+
+
+def test_seal_recovery_conflicts_on_different_cargo_after_operational_error(
+    client, monkeypatch
+):
+    """恢复分支：同案件编号但货物 / 区间不同 -> 409 case_id_conflict。"""
+    iid, snap = build_two_party_interval(client, )
+    seal(client, "CASE-OE-CARGO", "C1", iid, snap)
+    setup_cargo(client, cargo="C2")
+
+    _fail_first_tx_get_with_operational_error(monkeypatch)
+    r = seal(client, "CASE-OE-CARGO", "C2", iid, snap, expected=409)
+    assert r.json()["error"]["code"] == "case_id_conflict"
+    got = client.get("/evidence-seals/CASE-OE-CARGO").json()
+    assert got["cargo_id"] == "C1" and got["interval_id"] == iid
+    assert seal_count() == 1
+
+
+def test_seal_recovery_retries_tx_when_no_seal_after_operational_error(
+    client, monkeypatch
+):
+    """恢复分支：回滚后查不到封存 -> 沿既有事务路径重试并成功创建。"""
+    iid, snap = build_two_party_interval(client, )
+    _fail_first_tx_get_with_operational_error(monkeypatch)
+    r = seal(client, "CASE-OE-NEW", "C1", iid, snap, expected=201)
+    body = r.json()
+    assert body["cargo_id"] == "C1"
+    assert body["interval_id"] == iid
+    assert body["snapshot_id"] == snap
+    assert seal_count() == 1  # 重试只产生一条封存
+    # 成功后普通重传仍是既有契约：200 replayed
+    r2 = seal(client, "CASE-OE-NEW", "C1", iid, snap, expected=200)
+    assert r2.json()["replayed"] is True
+
 
 
 # --------------------------------------------------------------- 现况对照

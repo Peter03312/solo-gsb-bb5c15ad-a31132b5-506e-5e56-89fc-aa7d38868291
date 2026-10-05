@@ -1144,3 +1144,48 @@ curl -sS -o /dev/null -w "    货物不存在    HTTP %{http_code}\n" -G "$BASE/
   --data-urlencode "start_at=2026-10-11T06:00:00+08:00" \
   --data-urlencode "end_at=2026-10-11T20:00:00+08:00" \
   --data-urlencode "max_gap_seconds=7200"
+
+# ============================================================
+# 数据库操作异常（锁等待 / 死锁中止，可能在 commit 落库后抛出）后的
+# 封存重试裁决：同请求返回原包（200 replayed），异请求 409，未
+# 落库则服务端按同一请求自动重试创建。客户端只需用【完全相同的请求体】
+# 原样重发即可，下面演示三种裁决的可观察契约。
+# ============================================================
+RC="C-SEAL-RETRY"; RCASE="CASE-SEAL-RETRY-1"
+curl -sS -o /dev/null -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$RC\", \"started_at\": \"2026-10-12T08:00:00+08:00\",
+  \"temp_upper_limit\": \"5\", \"initial_holder\": \"甲冷库\"}"
+curl -sS -o /dev/null -X POST "$BASE/events" -H 'Content-Type: application/json' -d \
+  "{\"event_id\":\"re-m1\",\"cargo_id\":\"$RC\",\"occurred_at\":\"2026-10-12T09:00:00+08:00\",\"temperature\":\"8\"}"
+curl -sS -o /dev/null -X POST "$BASE/events" -H 'Content-Type: application/json' -d \
+  "{\"event_id\":\"re-m2\",\"cargo_id\":\"$RC\",\"occurred_at\":\"2026-10-12T10:00:00+08:00\",\"temperature\":\"4\"}"
+read -r RIID RSNAP < <(python3 - "$BASE" "$RC" <<'PY'
+import json, sys, urllib.request
+base, cargo = sys.argv[1], sys.argv[2]
+with urllib.request.urlopen(f"{base}/cargo/{cargo}/responsibilities") as r:
+    iv = json.load(r)["intervals"][0]
+print(iv["interval_id"], iv["snapshot_id"])
+PY
+)
+
+echo "81) 封存重试裁决：首次创建 201；同请求重放 200 replayed；异请求 409 case_id_conflict"
+echo "    a) 首次创建（异常恢复路径查不到已落库封存时，服务端即按此路径重试创建）"
+curl -sS -o /dev/null -w "       首次创建            HTTP %{http_code}\n" -X POST "$BASE/evidence-seals" \
+  -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"$RCASE\", \"cargo_id\": \"$RC\",
+  \"interval_id\": \"$RIID\", \"snapshot_id\": \"$RSNAP\"}"
+echo "    b) 同案件编号 + 同三元组（异常恢复同样裁决）-> 200 replayed=true，原包不变"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"$RCASE\", \"cargo_id\": \"$RC\",
+  \"interval_id\": \"$RIID\", \"snapshot_id\": \"$RSNAP\"
+}" | python3 -c 'import json,sys; print("       replayed =", json.load(sys.stdin)["replayed"])'
+echo "    c) 同案件编号 + 异快照 -> 409 case_id_conflict（错误体不回显原封存字段）"
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"$RCASE\", \"cargo_id\": \"$RC\",
+  \"interval_id\": \"$RIID\", \"snapshot_id\": \"sha256:$(python3 -c 'print("e"*64)')\"
+}" | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("       code =", e["code"], "/ message =", e["message"])'
+echo "    d) 原封存包仍可原样查询（append-only，未被改写 / 泄露）"
+curl -sS "$BASE/evidence-seals/$RCASE" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("       cargo =", d["cargo_id"], "snapshot =", d["snapshot_id"], "digest =", d["content_digest"][:19], "…")'
